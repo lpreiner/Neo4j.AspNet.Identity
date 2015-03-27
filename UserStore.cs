@@ -14,36 +14,27 @@ namespace Neo4j.AspNet.Identity
         IUserPasswordStore<TUser>, IUserSecurityStampStore<TUser>, IUserStore<TUser>, IUserEmailStore<TUser>
         where TUser : IdentityUser
     {
-        private readonly GraphClient db;
-        private bool _disposed;
+		const string LOGIN_NODE_LABEL = "Login";
+		const string USER_NODE_LABEL = "User";		
+		const string USER_LOGIN_LABEL = "HAS_LOGIN";
+		
+        readonly GraphClient db;
+        bool _disposed;
 
-        private GraphClient GetGraphDatabaseFromUri(string serverUriOrName)
+        static GraphClient GetGraphDatabaseFromUri(string serverUriOrName)
         {
-            if (serverUriOrName.ToLower().Contains("http://"))
-            {
-                return new GraphClient(new Uri(serverUriOrName));
-            }
-            else
-            {
-                return new GraphClient(new Uri(ConfigurationManager.ConnectionStrings[serverUriOrName].ConnectionString));
-            }
-        }
-
-        public UserStore()
-            :this("DefaultConnection")
-        {
-
+            return new GraphClient(new Uri(serverUriOrName));
         }
 
         public UserStore(string connectionNameOrUri)
-        {
-            db = GetGraphDatabaseFromUri(connectionNameOrUri);
-            db.Connect();
-        }
+			: this(GetGraphDatabaseFromUri(connectionNameOrUri))
+        { }
 
         public UserStore(GraphClient neoDb)
         {
-            db = neoDb;
+			neoDb.Connect();
+
+            db = neoDb;			
         }
 
         #region IUserLoginStore
@@ -51,11 +42,23 @@ namespace Neo4j.AspNet.Identity
         public Task AddLoginAsync(TUser user, UserLoginInfo login)
         {
             ThrowIfDisposed();
-            if (user == null)
+            if (user == null || user.Id == null)
                 throw new ArgumentNullException("user");
 
             if (!user.Logins.Any(x => x.LoginProvider == login.LoginProvider && x.ProviderKey == login.ProviderKey))
             {
+				db.Cypher
+					.Match(GetUserNode("u"), GetLoginNode("l"))
+					.Where((TUser u) => u.Id == user.Id)
+					.AndWhere((UserLoginInfo l) => l.LoginProvider == login.LoginProvider)
+					.Create("(u)-[ul:HAS_LOGIN {login}]->(l)")
+					.WithParam("login", new 
+						{ 
+							ProviderKey = login.ProviderKey,
+							ConnectedOn = DateTime.Now,
+						})
+					.ExecuteWithoutResults();
+
                 user.Logins.Add(login);
             }
 
@@ -64,7 +67,19 @@ namespace Neo4j.AspNet.Identity
 
         public Task<TUser> FindAsync(UserLoginInfo login)
         {
-            throw new NotImplementedException();
+            ThrowIfDisposed();
+            if (login == null)
+                throw new ArgumentNullException("login");
+
+            var query = db.Cypher
+                .Match(GetLoginNode("l") + "<-[ul:HAS_LOGIN]-" + GetUserNode("u"))
+                .Where((UserLoginInfo l) => l.LoginProvider == login.LoginProvider)
+				.AndWhere((UserLoginInfo ul) => ul.ProviderKey == login.ProviderKey)
+                .Return(u => u.As<TUser>());
+
+			var user = query.Results.FirstOrDefault();
+
+            return Task.FromResult(user);
         }
 
         public Task<IList<UserLoginInfo>> GetLoginsAsync(TUser user)
@@ -94,20 +109,27 @@ namespace Neo4j.AspNet.Identity
                 throw new ArgumentNullException("user");
 
             user.Id = Guid.NewGuid().ToString();
-            //db.GetCollection<TUser>(collectionName).Insert(user);
 
             db.Cypher.Create("(u:User { user })")
                                       .WithParams(new { user })
                                       .ExecuteWithoutResults();
-
-
 
             return Task.FromResult(user);
         }
 
         public Task DeleteAsync(TUser user)
         {
-            throw new NotImplementedException();
+            ThrowIfDisposed();
+            if (user == null || user.Id == null)
+                throw new ArgumentNullException("user");
+
+            db.Cypher
+				.Match(GetUserNode("u"))
+                .Where((TUser u) => u.Id == user.Id)
+                .Delete("u")
+                .ExecuteWithoutResults();
+
+            return Task.FromResult(0);
         }
 
         public Task<TUser> FindByIdAsync(string userId)
@@ -115,13 +137,12 @@ namespace Neo4j.AspNet.Identity
             ThrowIfDisposed();
 
             TUser user = db.Cypher
-                      .Match("(u:User)")
+					  .Match(GetUserNode("u"))
                       .Where((TUser u) => u.Id == userId)
                       .Return(u => u.As<TUser>())
                       .Results
                       .SingleOrDefault();
 
-            //   TUser user = db.GetCollection<TUser>(collectionName).FindOne((Query.EQ("_id", ObjectId.Parse(userId))));
             return Task.FromResult(user);
         }
 
@@ -130,27 +151,37 @@ namespace Neo4j.AspNet.Identity
             ThrowIfDisposed();
 
             TUser user = db.Cypher
-                        .Match("(u:User)")
+						.Match(GetUserNode("u"))
                         .Where((TUser u) => u.UserName == userName)
                         .Return(u => u.As<TUser>())
                         .Results
-                        .SingleOrDefault();
+                        .FirstOrDefault();
 
-
-            // TUser user = db.GetCollection<TUser>(collectionName).FindOne((Query.EQ("UserName", userName)));
             return Task.FromResult(user);
         }
 
         public Task UpdateAsync(TUser user)
         {
-            throw new NotImplementedException();
+            ThrowIfDisposed();
+            if (user == null || user.Id == null)
+                throw new ArgumentNullException("user");
+
+            db.Cypher
+				.Match(GetUserNode("u"))
+                .Where((TUser u) => u.Id == user.Id)
+                .Set("u = {user}")
+                .WithParam("user", user)
+                .ExecuteWithoutResults();
+
+            return Task.FromResult(user);
         }
 
         public void Dispose()
         {
             _disposed = true;
         } 
-        #endregion
+        
+		#endregion
 
         #region IUserClaimStore
 
@@ -169,17 +200,19 @@ namespace Neo4j.AspNet.Identity
                 });
             }
 
-
             return Task.FromResult(0);
         }
 
-        public Task<IList<System.Security.Claims.Claim>> GetClaimsAsync(TUser user)
+        public Task<IList<Claim>> GetClaimsAsync(TUser user)
         {
             ThrowIfDisposed();
             if (user == null)
                 throw new ArgumentNullException("user");
 
-            IList<Claim> result = user.Claims.Select(c => new Claim(c.ClaimType, c.ClaimValue)).ToList();
+			var roles = GetRolesAsync(user).Result.Take(0).Select(r => new Claim(ClaimTypes.Role, r));
+            var claims = user.Claims.Select(c => new Claim(c.ClaimType, c.ClaimValue));
+
+			IList<Claim> result = claims.Concat(roles).ToList();
             return Task.FromResult(result);
         }
 
@@ -294,13 +327,12 @@ namespace Neo4j.AspNet.Identity
             ThrowIfDisposed();
 
             TUser user = db.Cypher
-                      .Match("(u:User)")
+					  .Match(GetUserNode("u"))
                       .Where((TUser u) => u.Email == email)
                       .Return(u => u.As<TUser>())
                       .Results
                       .SingleOrDefault();
-
-            //TUser user = db.GetCollection<TUser>(collectionName).FindOne((Query.EQ("email", email)));
+            
             return Task.FromResult(user);
         }
 
@@ -309,14 +341,12 @@ namespace Neo4j.AspNet.Identity
             ThrowIfDisposed();
 
             string email = db.Cypher
-                      .Match("(u:User)")
+					  .Match(GetUserNode("u"))
                       .Where((TUser u) => u.Id == user.Id)
                       .Return(u => u.As<TUser>())
                       .Results
                       .SingleOrDefault()
                       .Email;
-
-            //TUser user = db.GetCollection<TUser>(collectionName).FindOne((Query.EQ("email", email)));
 
             return Task.FromResult<string>(email);
         }
@@ -337,11 +367,30 @@ namespace Neo4j.AspNet.Identity
         } 
         #endregion
 
-        private void ThrowIfDisposed()
-        {
-            if (_disposed)
-                throw new ObjectDisposedException(GetType().Name);
-        }
-    }
+		#region Utility
 
+		void ThrowIfDisposed()
+		{
+			if (_disposed)
+				throw new ObjectDisposedException(GetType().Name);
+		}
+
+		string GetNode(string alias, string label)
+		{
+			return String.Format("({0}:{1})", alias, label);
+		}
+
+		string GetUserNode(string alias)
+		{
+			return GetNode(alias, USER_NODE_LABEL);
+		}
+
+		string GetLoginNode(string alias)
+		{
+			return GetNode(alias, LOGIN_NODE_LABEL);
+		}
+
+		#endregion
+
+	}
 }

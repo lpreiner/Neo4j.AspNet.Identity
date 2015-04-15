@@ -7,7 +7,6 @@ namespace Neo4j.AspNet.Identity
 {
     public class IdentityUserClaim
     {
-     
         public virtual string Id { get; set; }
      
         public virtual string UserId { get; set; }

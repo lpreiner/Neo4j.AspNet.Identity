@@ -15,8 +15,11 @@ namespace Neo4j.AspNet.Identity
         where TUser : IdentityUser
     {
 		const string LOGIN_NODE_LABEL = "Login";
-		const string USER_NODE_LABEL = "User";		
+		const string USER_NODE_LABEL = "User";
+		const string ROLE_NODE_LABEL = "Role";
+		
 		const string USER_LOGIN_LABEL = "HAS_LOGIN";
+		const string USER_ROLE_LABEL = "HAS_ROLE";
 		
         readonly GraphClient db;
         bool _disposed;
@@ -47,17 +50,19 @@ namespace Neo4j.AspNet.Identity
 
             if (!user.Logins.Any(x => x.LoginProvider == login.LoginProvider && x.ProviderKey == login.ProviderKey))
             {
-				db.Cypher
-					.Match(GetUserNode("u"), GetLoginNode("l"))
-					.Where((TUser u) => u.Id == user.Id)
-					.AndWhere((UserLoginInfo l) => l.LoginProvider == login.LoginProvider)
-					.Create("(u)-[ul:HAS_LOGIN {login}]->(l)")
-					.WithParam("login", new 
-						{ 
+				var q = db.Cypher
+					.Match("(u:" + USER_NODE_LABEL + " { Id: {userId} })")
+					.Merge("(u)-[r:" + USER_LOGIN_LABEL + "]->(l:" + LOGIN_NODE_LABEL + " { LoginProvider: {provider} })")
+					.OnCreate().Set("r = {login}")
+					.WithParam("userId", user.Id)
+					.WithParam("provider", login.LoginProvider)
+					.WithParam("login", new
+						{
 							ProviderKey = login.ProviderKey,
 							ConnectedOn = DateTime.Now,
-						})
-					.ExecuteWithoutResults();
+						});
+
+				q.ExecuteWithoutResults();
 
                 user.Logins.Add(login);
             }
@@ -170,7 +175,7 @@ namespace Neo4j.AspNet.Identity
 				.Match(GetUserNode("u"))
                 .Where((TUser u) => u.Id == user.Id)
                 .Set("u = {user}")
-                .WithParam("user", user)
+                .WithParam("user", user.PrimitiveOnlyCopy())
                 .ExecuteWithoutResults();
 
             return Task.FromResult(user);
@@ -235,7 +240,22 @@ namespace Neo4j.AspNet.Identity
                 throw new ArgumentNullException("user");
 
             if (!user.Roles.Contains(roleName, StringComparer.InvariantCultureIgnoreCase))
-                user.Roles.Add(roleName);
+			{
+				var q = db.Cypher
+					.Match("(u:" + USER_NODE_LABEL + " { Id: {userId} })")
+					.Merge("(u)-[ur:" + USER_ROLE_LABEL + "]->(r:" + ROLE_NODE_LABEL + " { Name: {role} })")
+					.OnCreate().Set("ur = {userRole}")
+					.WithParam("userId", user.Id)
+					.WithParam("role", roleName)
+					.WithParam("userRole", new
+					{	
+						AssignedOn = DateTime.Now,
+					});
+
+				q.ExecuteWithoutResults();
+
+				user.Roles.Add(roleName);
+			}   
 
             return Task.FromResult(true);
         }
@@ -246,16 +266,23 @@ namespace Neo4j.AspNet.Identity
             if (user == null)
                 throw new ArgumentNullException("user");
 
+			var query = db.Cypher
+			  .Match(GetUserNode("u") + "-[ur:HAS_ROLE]-" + GetNode("r", ROLE_NODE_LABEL))
+			  .Where((TUser u) => u.Id == user.Id)			  
+			  .Return(r => r.As<Role>());
+
+			var results = query.Results;
+
+			user.Roles = results.Select(r => r.Name).ToList();
+
             return Task.FromResult<IList<string>>(user.Roles);
         }
 
-        public Task<bool> IsInRoleAsync(TUser user, string roleName)
+        public async Task<bool> IsInRoleAsync(TUser user, string roleName)
         {
-            ThrowIfDisposed();
-            if (user == null)
-                throw new ArgumentNullException("user");
+			user.Roles = (await GetRolesAsync(user)).ToList();
 
-            return Task.FromResult(user.Roles.Contains(roleName, StringComparer.InvariantCultureIgnoreCase));
+            return user.Roles.Contains(roleName);
         }
 
         public Task RemoveFromRoleAsync(TUser user, string roleName)
@@ -264,7 +291,14 @@ namespace Neo4j.AspNet.Identity
             if (user == null)
                 throw new ArgumentNullException("user");
 
-            user.Roles.RemoveAll(r => String.Equals(r, roleName, StringComparison.InvariantCultureIgnoreCase));
+			db.Cypher
+				.Match(GetUserNode("u") + "-[ur:" + USER_ROLE_LABEL + "]->" + GetNode("r", ROLE_NODE_LABEL))
+				.Where((TUser u) => u.Id == user.Id)
+				.AndWhere((Role r) => r.Name == roleName)
+				.Delete("ur")
+				.ExecuteWithoutResults();
+
+            user.Roles.Remove(roleName);
 
             return Task.FromResult(0);
         } 
@@ -375,22 +409,33 @@ namespace Neo4j.AspNet.Identity
 				throw new ObjectDisposedException(GetType().Name);
 		}
 
-		string GetNode(string alias, string label)
+		string GetNode(string alias, string label, string propsParam = null)
 		{
-			return String.Format("({0}:{1})", alias, label);
+			if (String.IsNullOrWhiteSpace(propsParam))
+				return String.Format("({0}:{1})", alias, label);
+
+			return String.Format("({0}:{1} {{{2}}})", alias, label, propsParam);
 		}
 
-		string GetUserNode(string alias)
+		string GetUserNode(string alias, string propsParam = null)
 		{
-			return GetNode(alias, USER_NODE_LABEL);
+			return GetNode(alias, USER_NODE_LABEL, propsParam);
 		}
 
-		string GetLoginNode(string alias)
+		string GetLoginNode(string alias, string propsParam = null)
 		{
-			return GetNode(alias, LOGIN_NODE_LABEL);
+			return GetNode(alias, LOGIN_NODE_LABEL, propsParam);
 		}
 
 		#endregion
 
+		#region DTO
+
+		class Role
+		{
+			public string Name { get; set; }
+		}
+
+		#endregion
 	}
 }
